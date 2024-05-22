@@ -18,7 +18,7 @@ type Stringer interface {
 // A "thread" safe map of type string:Anything.
 // To avoid lock bottlenecks this map is dived to several (defaultShardCount) map shards.
 type ConcurrentMulMap[K Stringer, V any] struct {
-	shards    []*ConcurrentMulMapShared[K, V]
+	shards    []*concurrentMulMapShared[K, V]
 	shardsNum int
 	shardFn   HashFn[K]
 }
@@ -40,7 +40,7 @@ func WithShardsNum[K Stringer, V any](shardsNum int) MMapOpt[K, V] {
 	
 	return func(mulMap *ConcurrentMulMap[K, V]) {
 		mulMap.shardsNum = shardsNum
-		mulMap.shards = make([]*ConcurrentMulMapShared[K, V], shardsNum)
+		mulMap.shards = make([]*concurrentMulMapShared[K, V], shardsNum)
 	}
 }
 
@@ -51,7 +51,7 @@ func WithShardFn[K Stringer, V any](f func(key K) uint32) MMapOpt[K, V] {
 }
 
 // A "thread" safe string to anything map.
-type ConcurrentMulMapShared[K Stringer, V any] struct {
+type concurrentMulMapShared[K Stringer, V any] struct {
 	items        map[K]V
 	sync.RWMutex // Read Write mutex, guards access to internal map.
 }
@@ -60,7 +60,7 @@ func create[K Stringer, V any](opts ...MMapOpt[K, V]) *ConcurrentMulMap[K, V] {
 	m := &ConcurrentMulMap[K, V]{
 		shardFn:   strfnv32[K],
 		shardsNum: defaultShardCount,
-		shards:    make([]*ConcurrentMulMapShared[K, V], defaultShardCount),
+		shards:    make([]*concurrentMulMapShared[K, V], defaultShardCount),
 	}
 	
 	m.apply(opts)
@@ -73,8 +73,8 @@ func NewMMap[K Stringer, V any](opts ...MMapOpt[K, V]) *ConcurrentMulMap[K, V] {
 	return create[K, V](opts...)
 }
 
-// GetShard returns shard under given key
-func (m *ConcurrentMulMap[K, V]) GetShard(key K) *ConcurrentMulMapShared[K, V] {
+// getShard returns shard under given key
+func (m *ConcurrentMulMap[K, V]) getShard(key K) *concurrentMulMapShared[K, V] {
 	idx := uint(m.shardFn(key)) % uint(m.shardsNum)
 	m.needAllocate(int(idx))
 	
@@ -83,13 +83,13 @@ func (m *ConcurrentMulMap[K, V]) GetShard(key K) *ConcurrentMulMapShared[K, V] {
 
 func (m *ConcurrentMulMap[K, V]) needAllocate(idx int) {
 	if m.shards[idx] == nil {
-		m.shards[idx] = &ConcurrentMulMapShared[K, V]{items: make(map[K]V)}
+		m.shards[idx] = &concurrentMulMapShared[K, V]{items: make(map[K]V)}
 	}
 }
 
 func (m *ConcurrentMulMap[K, V]) MSet(data map[K]V) {
 	for key, value := range data {
-		shard := m.GetShard(key)
+		shard := m.getShard(key)
 		shard.Lock()
 		shard.items[key] = value
 		shard.Unlock()
@@ -99,7 +99,7 @@ func (m *ConcurrentMulMap[K, V]) MSet(data map[K]V) {
 // Sets the given value under the specified key.
 func (m *ConcurrentMulMap[K, V]) Set(key K, value V) {
 	// Get map shard.
-	shard := m.GetShard(key)
+	shard := m.getShard(key)
 	shard.Lock()
 	shard.items[key] = value
 	shard.Unlock()
@@ -113,7 +113,7 @@ type UpsertCb[V any] func(exist bool, valueInMap V, newValue V) V
 
 // Insert or Update - updates existing element or inserts a new one using UpsertCb
 func (m *ConcurrentMulMap[K, V]) Upsert(key K, value V, cb UpsertCb[V]) (res V) {
-	shard := m.GetShard(key)
+	shard := m.getShard(key)
 	shard.Lock()
 	v, ok := shard.items[key]
 	res = cb(ok, v, value)
@@ -125,7 +125,7 @@ func (m *ConcurrentMulMap[K, V]) Upsert(key K, value V, cb UpsertCb[V]) (res V) 
 // Sets the given value under the specified key if no value was associated with it.
 func (m *ConcurrentMulMap[K, V]) SetIfAbsent(key K, value V) bool {
 	// Get map shard.
-	shard := m.GetShard(key)
+	shard := m.getShard(key)
 	shard.Lock()
 	_, ok := shard.items[key]
 	if !ok {
@@ -138,7 +138,7 @@ func (m *ConcurrentMulMap[K, V]) SetIfAbsent(key K, value V) bool {
 // Get retrieves an element from map under given key.
 func (m *ConcurrentMulMap[K, V]) Get(key K) (V, bool) {
 	// Get shard
-	shard := m.GetShard(key)
+	shard := m.getShard(key)
 	shard.RLock()
 	// Get item from shard.
 	val, ok := shard.items[key]
@@ -165,7 +165,7 @@ func (m *ConcurrentMulMap[K, V]) Count() int {
 // Looks up an item under specified key
 func (m *ConcurrentMulMap[K, V]) Has(key K) bool {
 	// Get shard
-	shard := m.GetShard(key)
+	shard := m.getShard(key)
 	shard.RLock()
 	// See if element is within shard.
 	_, ok := shard.items[key]
@@ -176,7 +176,7 @@ func (m *ConcurrentMulMap[K, V]) Has(key K) bool {
 // Remove removes an element from the map.
 func (m *ConcurrentMulMap[K, V]) Remove(key K) {
 	// Try to get shard.
-	shard := m.GetShard(key)
+	shard := m.getShard(key)
 	shard.Lock()
 	delete(shard.items, key)
 	shard.Unlock()
@@ -191,7 +191,7 @@ type RemoveCb[K any, V any] func(key K, v V, exists bool) bool
 // Returns the value returned by the callback (even if element was not present in the map)
 func (m *ConcurrentMulMap[K, V]) RemoveCb(key K, cb RemoveCb[K, V]) bool {
 	// Try to get shard.
-	shard := m.GetShard(key)
+	shard := m.getShard(key)
 	shard.Lock()
 	v, ok := shard.items[key]
 	remove := cb(key, v, ok)
@@ -205,7 +205,7 @@ func (m *ConcurrentMulMap[K, V]) RemoveCb(key K, cb RemoveCb[K, V]) bool {
 // Pop removes an element from the map and returns it
 func (m *ConcurrentMulMap[K, V]) Pop(key K) (v V, exists bool) {
 	// Try to get shard.
-	shard := m.GetShard(key)
+	shard := m.getShard(key)
 	shard.Lock()
 	v, exists = shard.items[key]
 	delete(shard.items, key)
@@ -267,7 +267,7 @@ func snapshot[K Stringer, V any](m *ConcurrentMulMap[K, V]) (chans []chan Tuple[
 	wg.Add(m.shardsNum)
 	// Foreach shard.
 	for index, shard := range m.shards {
-		go func(index int, shard *ConcurrentMulMapShared[K, V]) {
+		go func(index int, shard *concurrentMulMapShared[K, V]) {
 			// Foreach key, value pair.
 			shard.RLock()
 			chans[index] = make(chan Tuple[K, V], len(shard.items))
@@ -339,7 +339,7 @@ func (m *ConcurrentMulMap[K, V]) Keys() []K {
 		wg := sync.WaitGroup{}
 		wg.Add(m.shardsNum)
 		for _, shard := range m.shards {
-			go func(shard *ConcurrentMulMapShared[K, V]) {
+			go func(shard *concurrentMulMapShared[K, V]) {
 				// Foreach key, value pair.
 				shard.RLock()
 				for key := range shard.items {
